@@ -1,0 +1,20 @@
+# Ansible
+*.retry
+.vault_pass
+
+# SSH private keys — never commit
+*.pem
+*.key
+id_rsa
+
+# Large binary — generate locally, do not commit
+files/nginx-packages.tar.gz
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp

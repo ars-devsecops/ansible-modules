@@ -1,0 +1,119 @@
+---
+# =============================================================================
+# setup-nginx-slave.yml
+# Playbook : Copy nginx offline packages from master → slave, install & start
+# Master   : Has nginx-packages.tar.gz at /tmp/nginx-packages.tar.gz
+# Slave    : slave-user already exists, SSH already configured
+# Run as   : ansible-playbook playbooks/setup-nginx-slave.yml -i inventory/hosts.ini
+# Author   : Amol Shinde (@ars-devsecops)
+# =============================================================================
+
+- name: Install and Start Nginx on Slave Server
+  hosts: slave
+  become: yes
+  become_user: root
+
+  vars:
+    # ── Paths on master (controller) ────────────────────────────────────────
+    master_tar_path: /tmp/nginx-packages.tar.gz
+
+    # ── Paths on slave (remote) ──────────────────────────────────────────────
+    slave_tar_dest:    /tmp/nginx-packages.tar.gz
+    slave_extract_dir: /tmp/nginx-packages
+
+  tasks:
+
+    # ── Step 1: Verify tar exists on master before starting ──────────────────
+    - name: Check nginx tar exists on master
+      delegate_to: localhost
+      become: no
+      ansible.builtin.stat:
+        path: "{{ master_tar_path }}"
+      register: tar_check
+
+    - name: Fail if tar not found on master
+      ansible.builtin.fail:
+        msg: >
+          nginx-packages.tar.gz not found at {{ master_tar_path }} on master.
+          Run the following on master first:
+            sudo dnf install nginx --downloadonly --downloaddir=/tmp/nginx-packages -y
+            sudo dnf download --resolve --alldeps nginx --downloaddir=/tmp/nginx-packages
+            cd /tmp && tar -czvf nginx-packages.tar.gz nginx-packages/
+      when: not tar_check.stat.exists
+
+    # ── Step 2: Create extract directory on slave ─────────────────────────────
+    - name: Ensure extract directory exists on slave
+      ansible.builtin.file:
+        path: "{{ slave_extract_dir }}"
+        state: directory
+        mode: '0755'
+
+    # ── Step 3: Copy tar from master to slave ────────────────────────────────
+    - name: Copy nginx-packages.tar.gz to slave
+      ansible.builtin.copy:
+        src:  "{{ master_tar_path }}"
+        dest: "{{ slave_tar_dest }}"
+        mode: '0644'
+      register: copy_result
+
+    - name: Confirm copy
+      ansible.builtin.debug:
+        msg: "✅ Copied {{ copy_result.dest }} ({{ copy_result.size }} bytes)"
+
+    # ── Step 4: Extract tar on slave ──────────────────────────────────────────
+    - name: Extract nginx packages on slave
+      ansible.builtin.unarchive:
+        src:        "{{ slave_tar_dest }}"
+        dest:       /tmp/
+        remote_src: yes
+
+    # ── Step 5: Install nginx from RPMs (offline — no internet needed) ────────
+    - name: Install nginx RPMs offline
+      ansible.builtin.command: >
+        dnf install {{ slave_extract_dir }}/*.rpm
+        --disablerepo=*
+        --allowerasing
+        -y
+      register: dnf_result
+      changed_when: "'Nothing to do' not in dnf_result.stdout"
+
+    - name: DNF install output
+      ansible.builtin.debug:
+        msg: "{{ dnf_result.stdout_lines[-5:] }}"
+
+    # ── Step 6: Start and enable nginx ───────────────────────────────────────
+    - name: Start and enable nginx
+      ansible.builtin.service:
+        name:    nginx
+        state:   started
+        enabled: yes
+
+    # ── Step 7: Verify nginx is running ──────────────────────────────────────
+    - name: Verify nginx service is active
+      ansible.builtin.systemd:
+        name: nginx
+      register: nginx_status
+
+    - name: Nginx status
+      ansible.builtin.debug:
+        msg: "nginx is {{ nginx_status.status.ActiveState }}"
+
+    - name: Fail if nginx is not running
+      ansible.builtin.fail:
+        msg: "❌ nginx failed to start on slave — check: journalctl -u nginx -n 30"
+      when: nginx_status.status.ActiveState != "active"
+
+    # ── Step 8: Cleanup tmp files on slave ───────────────────────────────────
+    - name: Remove tar and extracted RPMs from /tmp
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ slave_tar_dest }}"
+        - "{{ slave_extract_dir }}"
+
+    - name: "✅ Nginx installation complete"
+      ansible.builtin.debug:
+        msg: >
+          Nginx installed and running on slave server.
+          Test: curl http://{{ inventory_hostname }}
