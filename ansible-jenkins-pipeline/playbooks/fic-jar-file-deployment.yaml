@@ -1,0 +1,138 @@
+---
+# =============================================================================
+# fic-jar-file-deployment.yaml
+# Playbook: JAR File Backup + Deploy from JFrog Artifactory
+# Target:   172.24.5.128 (ec2-user)
+# Path:     /var/lib/jenkins/core-unicom/UNI-FIC-BE-UAT/
+# ars-devsecops | Amol Shinde
+# =============================================================================
+
+- name: JAR File Deployment — FIC PDF Handler
+  hosts: app_servers
+  become: true
+  become_user: ec2-user
+  gather_facts: true
+
+  vars:
+    deployment_timestamp: "{{ ansible_date_time.iso8601_basic_short }}"
+
+  pre_tasks:
+
+    - name: "Verify target directories exist"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+        owner: ec2-user
+        group: ec2-user
+      loop:
+        - "{{ app_base_path }}"
+        - "{{ app_backup_jar_path }}"
+
+    - name: "Check if current JAR exists"
+      ansible.builtin.stat:
+        path: "{{ app_base_path }}/{{ jar_name }}"
+      register: current_jar
+
+  tasks:
+
+    # ── Step 1: Backup existing JAR ──────────────────────────────────────────
+    - name: "Backup existing JAR to backup directory"
+      ansible.builtin.copy:
+        src:  "{{ app_base_path }}/{{ jar_name }}"
+        dest: "{{ app_backup_jar_path }}/{{ jar_name }}.{{ deployment_timestamp }}.bak"
+        remote_src: true
+        owner: ec2-user
+        group: ec2-user
+        mode: '0644'
+      when: current_jar.stat.exists
+      register: backup_result
+
+    - name: "Backup result"
+      ansible.builtin.debug:
+        msg: "JAR backed up to {{ app_backup_jar_path }}/{{ jar_name }}.{{ deployment_timestamp }}.bak"
+      when: backup_result is changed
+
+    # ── Step 2: Clean old backups (keep last 5) ───────────────────────────────
+    - name: "Find old backup files"
+      ansible.builtin.find:
+        paths: "{{ app_backup_jar_path }}"
+        patterns: "*.bak"
+        age: "7d"
+      register: old_backups
+
+    - name: "Remove backups older than 7 days"
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_backups.files }}"
+      when: old_backups.files | length > 0
+
+    # ── Step 3: Download new JAR from JFrog ──────────────────────────────────
+    - name: "Download JAR from JFrog Artifactory"
+      ansible.builtin.get_url:
+        url:      "{{ jfrog_jar_url }}"
+        dest:     "{{ app_base_path }}/{{ jar_name }}"
+        url_username: "{{ jfrog_username }}"
+        url_password: "{{ jfrog_password }}"
+        force:    true
+        mode:     '0755'
+        owner:    ec2-user
+        group:    ec2-user
+        validate_certs: true
+        timeout:  120
+      register: download_result
+      notify: restart_service
+
+    - name: "Download result"
+      ansible.builtin.debug:
+        msg: "JAR downloaded successfully: {{ download_result.dest }}"
+      when: download_result is changed
+
+    # ── Step 4: Verify JAR integrity ─────────────────────────────────────────
+    - name: "Verify downloaded JAR is valid (non-zero size)"
+      ansible.builtin.stat:
+        path: "{{ app_base_path }}/{{ jar_name }}"
+      register: new_jar
+
+    - name: "Fail if JAR is empty or missing"
+      ansible.builtin.fail:
+        msg: "JAR file is missing or zero bytes after download — aborting deployment"
+      when: not new_jar.stat.exists or new_jar.stat.size == 0
+
+    - name: "JAR deployment verification passed"
+      ansible.builtin.debug:
+        msg: "JAR size: {{ new_jar.stat.size }} bytes — deployment verified"
+
+  handlers:
+
+    - name: restart_service
+      ansible.builtin.systemd:
+        name:    "{{ jar_service_name }}"
+        state:   restarted
+        daemon_reload: true
+      become: true
+      become_user: root
+      listen: restart_service
+
+  post_tasks:
+
+    - name: "Wait for service to come up"
+      ansible.builtin.pause:
+        seconds: 15
+
+    - name: "Verify service is running after deployment"
+      ansible.builtin.systemd:
+        name: "{{ jar_service_name }}"
+      register: service_status
+      become: true
+      become_user: root
+
+    - name: "Service status check"
+      ansible.builtin.debug:
+        msg: "Service {{ jar_service_name }} is {{ service_status.status.ActiveState }}"
+
+    - name: "Fail if service is not active"
+      ansible.builtin.fail:
+        msg: "Service {{ jar_service_name }} failed to start after deployment!"
+      when: service_status.status.ActiveState != "active"

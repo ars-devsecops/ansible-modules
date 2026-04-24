@@ -1,0 +1,50 @@
+---
+# =============================================================================
+# fic-service-restart.yaml
+# Playbook: Restart application service on target server
+# Target:   172.24.5.128 (ec2-user)
+# ars-devsecops | Amol Shinde
+# =============================================================================
+
+- name: Service Restart — FIC PDF Handler
+  hosts: app_servers
+  become: true
+  become_user: root
+  gather_facts: false
+
+  tasks:
+
+    - name: "Reload systemd daemon"
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: "Restart {{ jar_service_name }}"
+      ansible.builtin.systemd:
+        name:  "{{ jar_service_name }}"
+        state: restarted
+      register: restart_result
+
+    - name: "Wait for service to stabilise"
+      ansible.builtin.pause:
+        seconds: 20
+
+    - name: "Check service status"
+      ansible.builtin.systemd:
+        name: "{{ jar_service_name }}"
+      register: service_status
+
+    - name: "Print service state"
+      ansible.builtin.debug:
+        msg: >
+          Service: {{ jar_service_name }}
+          State:   {{ service_status.status.ActiveState }}
+          PID:     {{ service_status.status.MainPID | default('N/A') }}
+
+    - name: "Fail if service is not active"
+      ansible.builtin.fail:
+        msg: "Service {{ jar_service_name }} failed to start! Check logs: journalctl -u {{ jar_service_name }} -n 50"
+      when: service_status.status.ActiveState != "active"
+
+    - name: "Service restart successful"
+      ansible.builtin.debug:
+        msg: "✅ {{ jar_service_name }} restarted and is running"

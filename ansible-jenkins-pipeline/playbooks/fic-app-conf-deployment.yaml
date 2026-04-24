@@ -1,0 +1,139 @@
+---
+# =============================================================================
+# fic-app-conf-deployment.yaml
+# Playbook: application.properties Backup + Deploy from JFrog Artifactory
+# Target:   172.24.5.128 (ec2-user)
+# Path:     /var/lib/jenkins/core-unicom/UNI-FIC-BE-UAT/
+# ars-devsecops | Amol Shinde
+# =============================================================================
+
+- name: Application Config Deployment — FIC PDF Handler
+  hosts: app_servers
+  become: true
+  become_user: ec2-user
+  gather_facts: true
+
+  vars:
+    deployment_timestamp: "{{ ansible_date_time.iso8601_basic_short }}"
+    workspace_conf_src:   "/var/lib/jenkins/workspace/UNI-FIC-BE-UAT/src/main/resources/application.properties"
+
+  pre_tasks:
+
+    - name: "Verify target directories exist"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+        owner: ec2-user
+        group: ec2-user
+      loop:
+        - "{{ app_conf_path }}"
+        - "{{ app_conf_backup_path }}"
+
+    - name: "Check if current application.properties exists"
+      ansible.builtin.stat:
+        path: "{{ app_conf_path }}/{{ app_conf_filename }}"
+      register: current_conf
+
+  tasks:
+
+    # ── Step 1: Backup existing application.properties ────────────────────────
+    - name: "Backup existing application.properties"
+      ansible.builtin.copy:
+        src:  "{{ app_conf_path }}/{{ app_conf_filename }}"
+        dest: "{{ app_conf_backup_path }}/{{ app_conf_filename }}.{{ deployment_timestamp }}.bak"
+        remote_src: true
+        owner: ec2-user
+        group: ec2-user
+        mode: '0644'
+      when: current_conf.stat.exists
+      register: conf_backup_result
+
+    - name: "Config backup result"
+      ansible.builtin.debug:
+        msg: "Config backed up to {{ app_conf_backup_path }}/{{ app_conf_filename }}.{{ deployment_timestamp }}.bak"
+      when: conf_backup_result is changed
+
+    # ── Step 2: Clean old config backups (older than 7 days) ─────────────────
+    - name: "Find old config backup files"
+      ansible.builtin.find:
+        paths:    "{{ app_conf_backup_path }}"
+        patterns: "*.bak"
+        age:      "7d"
+      register: old_conf_backups
+
+    - name: "Remove old config backups"
+      ansible.builtin.file:
+        path:  "{{ item.path }}"
+        state: absent
+      loop: "{{ old_conf_backups.files }}"
+      when: old_conf_backups.files | length > 0
+
+    # ── Step 3: Download new application.properties from JFrog ───────────────
+    - name: "Download application.properties from JFrog Artifactory"
+      ansible.builtin.get_url:
+        url:          "{{ jfrog_conf_url }}"
+        dest:         "{{ app_conf_path }}/{{ app_conf_filename }}"
+        url_username: "{{ jfrog_username }}"
+        url_password: "{{ jfrog_password }}"
+        force:        true
+        mode:         '0644'
+        owner:        ec2-user
+        group:        ec2-user
+        validate_certs: true
+        timeout:      60
+      register: conf_download_result
+      notify: restart_service
+
+    - name: "Config download result"
+      ansible.builtin.debug:
+        msg: "application.properties deployed to {{ app_conf_path }}"
+      when: conf_download_result is changed
+
+    # ── Step 4: Verify config file ────────────────────────────────────────────
+    - name: "Verify application.properties exists and is non-empty"
+      ansible.builtin.stat:
+        path: "{{ app_conf_path }}/{{ app_conf_filename }}"
+      register: new_conf
+
+    - name: "Fail if config is missing or empty"
+      ansible.builtin.fail:
+        msg: "application.properties is missing or empty after download — aborting!"
+      when: not new_conf.stat.exists or new_conf.stat.size == 0
+
+    - name: "Config deployment verified"
+      ansible.builtin.debug:
+        msg: "application.properties size: {{ new_conf.stat.size }} bytes — OK"
+
+  handlers:
+
+    - name: restart_service
+      ansible.builtin.systemd:
+        name:          "{{ jar_service_name }}"
+        state:         restarted
+        daemon_reload: true
+      become:      true
+      become_user: root
+      listen: restart_service
+
+  post_tasks:
+
+    - name: "Wait for service restart"
+      ansible.builtin.pause:
+        seconds: 15
+
+    - name: "Verify service is running"
+      ansible.builtin.systemd:
+        name: "{{ jar_service_name }}"
+      register: service_status
+      become:      true
+      become_user: root
+
+    - name: "Service status after config deploy"
+      ansible.builtin.debug:
+        msg: "Service {{ jar_service_name }} is {{ service_status.status.ActiveState }}"
+
+    - name: "Fail if service did not restart cleanly"
+      ansible.builtin.fail:
+        msg: "Service {{ jar_service_name }} is not active after config deployment!"
+      when: service_status.status.ActiveState != "active"

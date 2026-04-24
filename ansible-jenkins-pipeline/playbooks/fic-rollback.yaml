@@ -1,0 +1,93 @@
+---
+# =============================================================================
+# fic-rollback.yaml
+# Playbook: Emergency rollback — restore last backup of JAR + config
+# Target:   172.24.5.128 (ec2-user)
+# Usage:    ansible-playbook fic-rollback.yaml -i inventory/hosts.ini
+# ars-devsecops | Amol Shinde
+# =============================================================================
+
+- name: Emergency Rollback — FIC PDF Handler
+  hosts: app_servers
+  become: true
+  become_user: ec2-user
+  gather_facts: true
+
+  tasks:
+
+    # ── Rollback JAR ──────────────────────────────────────────────────────────
+    - name: "Find latest JAR backup"
+      ansible.builtin.find:
+        paths:    "{{ app_backup_jar_path }}"
+        patterns: "*.bak"
+        age_stamp: mtime
+      register: jar_backups
+
+    - name: "Fail if no JAR backup found"
+      ansible.builtin.fail:
+        msg: "No JAR backup found in {{ app_backup_jar_path }} — cannot rollback!"
+      when: jar_backups.files | length == 0
+
+    - name: "Set latest JAR backup path"
+      ansible.builtin.set_fact:
+        latest_jar_backup: "{{ (jar_backups.files | sort(attribute='mtime') | last).path }}"
+
+    - name: "Rollback JAR from backup: {{ latest_jar_backup }}"
+      ansible.builtin.copy:
+        src:        "{{ latest_jar_backup }}"
+        dest:       "{{ app_base_path }}/{{ jar_name }}"
+        remote_src: true
+        owner:      ec2-user
+        group:      ec2-user
+        mode:       '0755'
+
+    # ── Rollback Config ───────────────────────────────────────────────────────
+    - name: "Find latest config backup"
+      ansible.builtin.find:
+        paths:    "{{ app_conf_backup_path }}"
+        patterns: "*.bak"
+        age_stamp: mtime
+      register: conf_backups
+
+    - name: "Rollback application.properties if backup exists"
+      block:
+        - name: "Set latest config backup path"
+          ansible.builtin.set_fact:
+            latest_conf_backup: "{{ (conf_backups.files | sort(attribute='mtime') | last).path }}"
+
+        - name: "Rollback config from backup: {{ latest_conf_backup }}"
+          ansible.builtin.copy:
+            src:        "{{ latest_conf_backup }}"
+            dest:       "{{ app_conf_path }}/{{ app_conf_filename }}"
+            remote_src: true
+            owner:      ec2-user
+            group:      ec2-user
+            mode:       '0644'
+      when: conf_backups.files | length > 0
+
+    # ── Restart after rollback ────────────────────────────────────────────────
+    - name: "Restart service after rollback"
+      ansible.builtin.systemd:
+        name:          "{{ jar_service_name }}"
+        state:         restarted
+        daemon_reload: true
+      become:      true
+      become_user: root
+
+    - name: "Wait for service"
+      ansible.builtin.pause:
+        seconds: 20
+
+    - name: "Verify service is active after rollback"
+      ansible.builtin.systemd:
+        name: "{{ jar_service_name }}"
+      register: rollback_service_status
+      become:      true
+      become_user: root
+
+    - name: "Rollback status"
+      ansible.builtin.debug:
+        msg: >
+          ROLLBACK COMPLETE
+          JAR restored from: {{ latest_jar_backup }}
+          Service state:     {{ rollback_service_status.status.ActiveState }}

@@ -1,0 +1,264 @@
+// =============================================================================
+// Jenkins Pipeline — UNI-FIC-BE-UAT
+// Flow: Git Checkout → Build JAR → Upload to JFrog →
+//       Ansible: Deploy JAR → Ansible: Deploy Config → Service Restart
+// Ansible playbooks path: /var/lib/jenkins/core-unicom/UNI-FIC-BE-UAT/
+// Target server: 172.24.5.128
+// ars-devsecops | Amol Shinde
+// =============================================================================
+
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'TAG',     defaultValue: '',     description: 'Git tag to deploy (e.g. v1.0.5)')
+        string(name: 'GIT_URL', defaultValue: '',     description: 'Git repository URL')
+        choice(name: 'DEPLOY_TYPE',
+               choices: ['full', 'jar-only', 'config-only', 'service-restart-only'],
+               description: 'What to deploy')
+        booleanParam(name: 'ROLLBACK', defaultValue: false, description: 'Trigger rollback instead of deploy')
+    }
+
+    environment {
+        // ── Paths ──────────────────────────────────────────────────────────
+        ANSIBLE_PLAYBOOK_DIR  = '/var/lib/jenkins/core-unicom/UNI-FIC-BE-UAT'
+        ANSIBLE_INVENTORY     = "${ANSIBLE_PLAYBOOK_DIR}/inventory/hosts.ini"
+        WORKSPACE_DIR         = '/var/lib/jenkins/workspace/UNI-FIC-BE-UAT'
+
+        // ── JFrog ──────────────────────────────────────────────────────────
+        JFROG_URL             = 'https://artifactory.godrejhf.com/artifactory'
+        JFROG_REPO            = 'Core-unicom/UNI-FIC-BE-UAT'
+        JAR_NAME              = 'final_interest_letter_pdf_handler-0.0.1-SNAPSHOT.jar'
+        JAR_PATTERN           = 'target/final_interest_letter_pdf_handler-0.0.1-SNAPSHOT.jar'
+        CONF_SRC              = 'src/main/resources/application.properties'
+
+        // ── Credentials IDs (set in Jenkins Credentials Manager) ──────────
+        REPO_CRED             = 'git-repo-credentials'
+        JFROG_CRED            = 'cp-fe-creds'
+        ANSIBLE_VAULT_PASS    = 'ansible-vault-password'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 45, unit: 'MINUTES')
+        timestamps()
+        disableConcurrentBuilds()
+        ansiColor('xterm')
+    }
+
+    stages {
+
+        // ── Stage 0: Rollback (short-circuit) ─────────────────────────────
+        stage('Rollback') {
+            when { expression { params.ROLLBACK == true } }
+            steps {
+                echo "⚠️  ROLLBACK TRIGGERED — skipping build stages"
+                script {
+                    runAnsible('fic-rollback.yaml', 'Rollback')
+                }
+            }
+            post {
+                success { echo "✅ Rollback completed successfully" }
+                failure { error "❌ Rollback failed — manual intervention required!" }
+            }
+        }
+
+        // ── Stage 1: Git Checkout ─────────────────────────────────────────
+        stage('Git Checkout') {
+            when { expression { params.ROLLBACK == false } }
+            steps {
+                echo "🔀 Checking out tag: ${params.TAG}"
+                git credentialsId: "${REPO_CRED}", url: "${params.GIT_URL}"
+                sh """
+                    git checkout tags/${params.TAG}
+                    echo "Checked out tag: ${params.TAG}"
+                    echo "Commit: \$(git rev-parse --short HEAD)"
+                    echo "Author: \$(git log -1 --pretty=%an)"
+                """
+            }
+        }
+
+        // ── Stage 2: Build Artifact ───────────────────────────────────────
+        stage('Build Artifact') {
+            when {
+                allOf {
+                    expression { params.ROLLBACK == false }
+                    expression { params.DEPLOY_TYPE in ['full', 'jar-only'] }
+                }
+            }
+            steps {
+                echo "🏗️  Building JAR..."
+                sh """
+                    mvn clean install -DskipTests=false \
+                        -Dmaven.test.failure.ignore=false \
+                        --batch-mode \
+                        --no-transfer-progress
+                """
+            }
+            post {
+                success {
+                    echo "✅ Build successful — JAR at: ${JAR_PATTERN}"
+                    archiveArtifacts artifacts: "${JAR_PATTERN}", fingerprint: true
+                }
+                failure {
+                    error "❌ Maven build failed — stopping pipeline"
+                }
+            }
+        }
+
+        // ── Stage 3: Upload JAR to JFrog Artifactory ─────────────────────
+        stage('Upload JAR to JFrog') {
+            when {
+                allOf {
+                    expression { params.ROLLBACK == false }
+                    expression { params.DEPLOY_TYPE in ['full', 'jar-only'] }
+                }
+            }
+            steps {
+                echo "📦 Uploading JAR to JFrog Artifactory..."
+                script {
+                    def server = Artifactory.newServer(
+                        url:           "${JFROG_URL}",
+                        credentialsId: "${JFROG_CRED}"
+                    )
+
+                    def uploadSpec = """{
+                        "files": [{
+                            "pattern": "${JAR_PATTERN}",
+                            "target":  "${JFROG_REPO}/",
+                            "props":   "build.tag=${params.TAG};jenkins.build=${BUILD_NUMBER};git.branch=${GIT_BRANCH}"
+                        }]
+                    }"""
+
+                    def buildInfo = server.upload(uploadSpec)
+                    server.publishBuildInfo(buildInfo)
+                    echo "✅ JAR uploaded to: ${JFROG_URL}/${JFROG_REPO}/${JAR_NAME}"
+                }
+            }
+        }
+
+        // ── Stage 4: Upload Config to JFrog ──────────────────────────────
+        stage('Upload Config to JFrog') {
+            when {
+                allOf {
+                    expression { params.ROLLBACK == false }
+                    expression { params.DEPLOY_TYPE in ['full', 'config-only'] }
+                }
+            }
+            steps {
+                echo "📦 Uploading application.properties to JFrog..."
+                script {
+                    def server = Artifactory.newServer(
+                        url:           "${JFROG_URL}",
+                        credentialsId: "${JFROG_CRED}"
+                    )
+
+                    def uploadSpec = """{
+                        "files": [{
+                            "pattern": "${CONF_SRC}",
+                            "target":  "${JFROG_REPO}/"
+                        }]
+                    }"""
+
+                    server.upload(uploadSpec)
+                    echo "✅ application.properties uploaded to JFrog"
+                }
+            }
+        }
+
+        // ── Stage 5: Ansible — Deploy JAR ────────────────────────────────
+        stage('Deploy JAR via Ansible') {
+            when {
+                allOf {
+                    expression { params.ROLLBACK == false }
+                    expression { params.DEPLOY_TYPE in ['full', 'jar-only'] }
+                }
+            }
+            steps {
+                echo "🚀 Running Ansible: JAR deployment to 172.24.5.128..."
+                script {
+                    runAnsible('fic-jar-file-deployment.yaml', 'JAR Deployment')
+                }
+            }
+        }
+
+        // ── Stage 6: Ansible — Deploy Config ─────────────────────────────
+        stage('Deploy Config via Ansible') {
+            when {
+                allOf {
+                    expression { params.ROLLBACK == false }
+                    expression { params.DEPLOY_TYPE in ['full', 'config-only'] }
+                }
+            }
+            steps {
+                echo "⚙️  Running Ansible: Config deployment to 172.24.5.128..."
+                script {
+                    runAnsible('fic-app-conf-deployment.yaml', 'Config Deployment')
+                }
+            }
+        }
+
+        // ── Stage 7: Service Restart ──────────────────────────────────────
+        stage('Service Restart') {
+            when {
+                allOf {
+                    expression { params.ROLLBACK == false }
+                    expression { params.DEPLOY_TYPE in ['full', 'service-restart-only'] }
+                }
+            }
+            steps {
+                echo "🔄 Restarting service via Ansible..."
+                script {
+                    runAnsible('fic-service-restart.yaml', 'Service Restart')
+                }
+            }
+        }
+
+    } // end stages
+
+    // ── Post Actions ──────────────────────────────────────────────────────────
+    post {
+        success {
+            echo """
+            ╔══════════════════════════════════════════╗
+            ║   ✅ DEPLOYMENT SUCCESSFUL               ║
+            ║   Tag:   ${params.TAG}
+            ║   Build: ${BUILD_NUMBER}
+            ║   Type:  ${params.DEPLOY_TYPE}
+            ╚══════════════════════════════════════════╝
+            """
+        }
+        failure {
+            echo "❌ Pipeline FAILED — Build #${BUILD_NUMBER} | Tag: ${params.TAG}"
+            echo "💡 To rollback: re-run pipeline with ROLLBACK=true"
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
+
+// =============================================================================
+// Helper: Run Ansible Playbook
+// =============================================================================
+def runAnsible(String playbook, String stageName) {
+    withCredentials([
+        string(credentialsId: env.ANSIBLE_VAULT_PASS, variable: 'VAULT_PASS'),
+        usernamePassword(credentialsId: env.JFROG_CRED, usernameVariable: 'JFROG_USER', passwordVariable: 'JFROG_PASS')
+    ]) {
+        sh """
+            echo "Running Ansible playbook: ${playbook}"
+            echo "Stage: ${stageName}"
+            echo "Target: 172.24.5.128"
+
+            ansible-playbook \
+                -i ${ANSIBLE_INVENTORY} \
+                ${ANSIBLE_PLAYBOOK_DIR}/playbooks/${playbook} \
+                --extra-vars "jfrog_username=${JFROG_USER} jfrog_password=${JFROG_PASS}" \
+                --vault-password-file <(echo "${VAULT_PASS}") \
+                -v
+
+            echo "✅ ${stageName} completed"
+        """
+    }
+}

@@ -1,0 +1,27 @@
+# =============================================================================
+# Group Variables — app_servers
+# ars-devsecops | Amol Shinde
+# =============================================================================
+
+# ── Application Paths ─────────────────────────────────────────────────────────
+app_base_path:        /home/ec2-user/PDF/PDF_Handler/Final_Cert_PDF_Handler
+app_backup_jar_path:  /home/ec2-user/PDF/PDF_Handler/Final_Cert_PDF_Handler/Backup_jar
+app_conf_path:        /home/ec2-user/OnDemandAPIs/OnDemandCommAPIs
+app_conf_backup_path: /home/ec2-user/OnDemandAPIs/OnDemandCommAPIs/Backup_app_conf
+
+# ── JAR Details ───────────────────────────────────────────────────────────────
+jar_name:             final_interest_letter_pdf_handler-0.0.1-SNAPSHOT.jar
+jar_service_name:     final_interest_letter_pdf_handler-0.0.1.service
+
+# ── Application Config ────────────────────────────────────────────────────────
+app_conf_filename:    application.properties
+
+# ── JFrog Artifactory ─────────────────────────────────────────────────────────
+jfrog_base_url:       https://artifactory.godrejhf.com/artifactory
+jfrog_repo_path:      Core-unicom/UNI-FIC-BE-UAT
+jfrog_jar_url:        "{{ jfrog_base_url }}/{{ jfrog_repo_path }}/{{ jar_name }}"
+jfrog_conf_url:       "{{ jfrog_base_url }}/{{ jfrog_repo_path }}/{{ app_conf_filename }}"
+
+# ── Backup Settings ───────────────────────────────────────────────────────────
+backup_timestamp_format: "%Y%m%d_%H%M%S"
+max_backups_to_keep:     5
